@@ -1697,7 +1697,8 @@ mod tests {
     /// builder built it before the answers moved onto evidencebook
     /// (mesh-llm 29e25a31): artifact octets, material kinds and order,
     /// witness receipts. `CAPSULES_WRITE_ANSWER_FIXTURE=1` rewrites the
-    /// fixture instead (only ever from that commit).
+    /// fixture instead (only ever from that commit); the fixture's SHA-256 is
+    /// pinned below.
     #[test]
     fn every_answer_form_is_byte_for_byte_the_pre_evidencebook_answer() {
         let node = node();
@@ -1786,8 +1787,14 @@ mod tests {
             .unwrap();
             return;
         }
-        let want: serde_json::Map<String, Value> =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let text = std::fs::read(&path).unwrap();
+        // Pinned, so a rewrite from any commit but 29e25a31 fails here.
+        assert_eq!(
+            hex::encode(Sha256::digest(&text)),
+            "0beadccb7e337c3adfa69054502a5bab6cf1686593e52ae80fee07f4f08324cf",
+            "the fixture was rewritten"
+        );
+        let want: serde_json::Map<String, Value> = serde_json::from_slice(&text).unwrap();
         assert_eq!(
             got.keys().collect::<Vec<_>>(),
             want.keys().collect::<Vec<_>>()
