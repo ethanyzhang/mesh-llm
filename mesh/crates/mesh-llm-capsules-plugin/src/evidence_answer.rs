@@ -650,9 +650,10 @@ fn reply(
             tracing::warn!(error = %e, "an evidence answer could not be signed -- declining");
             Reason::PolicyDeclined
         }
-        AnswerError::RecordDigest | AnswerError::OverLimit | AnswerError::Substrate(_) => {
-            Reason::PolicyDeclined
-        }
+        AnswerError::RecordDigest
+        | AnswerError::OverLimit
+        | AnswerError::Artifact(_)
+        | AnswerError::Substrate(_) => Reason::PolicyDeclined,
     })?;
     let mut wire: Value = serde_json::from_slice(&signed.encode(Binding::Json))
         .map_err(|_| Reason::PolicyDeclined)?;

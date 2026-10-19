@@ -1692,4 +1692,168 @@ mod tests {
             b"\x84\x00"
         ));
     }
+
+    /// Every answer form this node builds, byte for byte as the plugin's own
+    /// builder built it before the answers moved onto evidencebook
+    /// (mesh-llm 29e25a31): artifact octets, material kinds and order,
+    /// witness receipts. `CAPSULES_WRITE_ANSWER_FIXTURE=1` rewrites the
+    /// fixture instead (only ever from that commit).
+    #[test]
+    fn every_answer_form_is_byte_for_byte_the_pre_evidencebook_answer() {
+        let node = node();
+        let last = node.anchors.len() - 1;
+        let half = hex::encode(Sha256::digest(b"the counterparty's own half"));
+        let (_, all) =
+            node.ask(&json!({"subject": {"full_history": null}, "coverage": node.pin(0)}));
+        let records = serde_json::from_slice::<Value>(&envelope_of(&all).artifact).unwrap()
+            ["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let mut cases: Vec<(String, Value)> = vec![
+            (
+                "range_last".into(),
+                json!({"subject": {"range": [290, 299]}, "coverage": node.pin(last)}),
+            ),
+            (
+                "full_history_first".into(),
+                json!({"subject": {"full_history": null}, "coverage": node.pin(0)}),
+            ),
+            (
+                "range_fresh".into(),
+                json!({"subject": {"range": [1, 3]}, "coverage": {"min_freshness": 1}}),
+            ),
+            (
+                "range".into(),
+                json!({"subject": {"range": [0, 2]}, "coverage": node.pin(1)}),
+            ),
+            (
+                "correlation".into(),
+                json!({"subject": {"correlation": "n-1"}, "coverage": node.pin(1)}),
+            ),
+            (
+                "exchange".into(),
+                json!({"subject": {"exchange": half}, "coverage": {"expected_pin": half}}),
+            ),
+            (
+                "checkpoints".into(),
+                json!({"subject": {"checkpoints": null}, "coverage": node.pin(last)}),
+            ),
+            (
+                "checkpoints_time".into(),
+                json!({"subject": {"checkpoints": null}, "coverage": {"min_freshness": "2026-01-01T00:00:00Z"}}),
+            ),
+            (
+                "history_card".into(),
+                json!({"subject": {"full_history": null}, "coverage": node.pin(last), "derivation": "history_card/1"}),
+            ),
+            (
+                "history_card_checkpoints".into(),
+                json!({"subject": {"checkpoints": null}, "coverage": node.pin(1), "derivation": "history_card/1"}),
+            ),
+            (
+                "served_summary".into(),
+                json!({"subject": {"full_history": null}, "coverage": node.pin(last), "derivation": "served_summary/1"}),
+            ),
+        ];
+        for (i, r) in records.iter().enumerate() {
+            let body = hex::decode(r["body"].as_str().unwrap()).unwrap();
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            if crate::producer::padding::is_padding(&parsed) {
+                continue;
+            }
+            for anchor in [0, last] {
+                if r["leaf_index"].as_u64().unwrap() < leaf_count(node_size(&node, anchor)).unwrap()
+                {
+                    cases.push((
+                        format!("record_{i}_at_{anchor}"),
+                        json!({"subject": {"record": r["digest"]}, "coverage": node.pin(anchor)}),
+                    ));
+                }
+            }
+        }
+        let got: serde_json::Map<String, Value> = cases
+            .iter()
+            .map(|(name, request)| (name.clone(), node.ask(request).1))
+            .collect();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/evidence_answers_29e25a31.json");
+        if std::env::var_os("CAPSULES_WRITE_ANSWER_FIXTURE").is_some() {
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&Value::Object(got)).unwrap() + "\n",
+            )
+            .unwrap();
+            return;
+        }
+        let want: serde_json::Map<String, Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            got.keys().collect::<Vec<_>>(),
+            want.keys().collect::<Vec<_>>()
+        );
+        for (name, wire) in &want {
+            assert_eq!(
+                serde_json::to_string(&got[name]).unwrap(),
+                serde_json::to_string(wire).unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    /// The MMR size of the node's checkpoint `i`, from its pinned answer.
+    fn node_size(node: &Node, i: usize) -> u64 {
+        let (_, reply) =
+            node.ask(&json!({"subject": {"checkpoints": null}, "coverage": node.pin(i)}));
+        let list = serde_json::from_slice::<Value>(&envelope_of(&reply).artifact).unwrap()
+            ["checkpoints"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let statement = hex::decode(list.last().unwrap().as_str().unwrap()).unwrap();
+        verify_checkpoint_cose_offline(&statement)
+            .decoded
+            .unwrap()
+            .mmr_size
+    }
+
+    /// The same record committed twice, once under each checkpoint, both
+    /// citing the half: the answer is served under the checkpoint covering
+    /// the later occurrence and carries both, as the plugin's own anchor
+    /// rule chose before the answers moved onto evidencebook.
+    #[test]
+    fn a_citing_record_committed_twice_is_served_under_its_later_position() {
+        use crate::evidence_request_parity::{corpus_checkpoints, write_jsonl};
+        let half = hex::encode(Sha256::digest(b"the counterparty's own half"));
+        let mut ledger = corpus_ledger();
+        let citing = ledger
+            .iter()
+            .position(|r| crate::evidence_log::counterparty_half_citations(r).contains(&half))
+            .unwrap();
+        assert!(citing < 16, "the corpus cites the half under checkpoint 0");
+        ledger[20] = ledger[citing].clone();
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_dir = dir.path().join("ledger");
+        let cps = corpus_checkpoints(&ledger, &key());
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        write_jsonl(
+            &ledger_dir.join(crate::evidence_log::CAPSULES_FILE),
+            &ledger,
+        );
+        let lines: Vec<Value> = cps.iter().map(|c| c.line()).collect();
+        write_jsonl(
+            &ledger_dir.join(crate::evidence_log::CHECKPOINTS_FILE),
+            &lines,
+        );
+        let node = Node {
+            _dir: dir,
+            ledger: ledger_dir,
+            anchors: cps.iter().map(|c| c.anchor()).collect(),
+        };
+        let (sent, reply) =
+            node.ask(&json!({"subject": {"exchange": half}, "coverage": {"expected_pin": half}}));
+        let checked = check_reply(&sent, &reply).unwrap();
+        assert_eq!(checked.anchor, node.anchors[1]);
+        assert_eq!(checked.records, vec![citing as u64, 20]);
+    }
 }

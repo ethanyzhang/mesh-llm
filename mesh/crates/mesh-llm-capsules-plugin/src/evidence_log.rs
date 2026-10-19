@@ -589,27 +589,17 @@ impl RecordSource for LogView<'_> {
     fn leaf_index_of(&self, digest: &str) -> Option<u64> {
         self.index.leaf_index_of(digest)
     }
-    fn correlation(&self, id: &str) -> Vec<String> {
-        self.capsule_ids(self.index.correlated(id))
+    fn correlation(&self, id: &str) -> Vec<u64> {
+        self.index.correlated(id).to_vec()
     }
-    fn citing(&self, half_digest: &str) -> Vec<String> {
-        self.capsule_ids(self.index.citing(half_digest))
+    fn citing(&self, half_digest: &str) -> Vec<u64> {
+        self.index.citing(half_digest).to_vec()
     }
     /// The body's recomputed `capsule_id`, or, for a body that is not a
     /// record of this format, its SHA-256: the two digests this node's
     /// requester accepts for a record (`evidence_artifact`).
     fn entry_of(&self, body: &[u8]) -> Option<String> {
         record_digest(body).or_else(|| Some(hex::encode(Sha256::digest(body))))
-    }
-}
-
-impl LogView<'_> {
-    fn capsule_ids(&self, leaves: &[u64]) -> Vec<String> {
-        leaves
-            .iter()
-            .filter_map(|&i| self.index.leaves.get(usize::try_from(i).ok()?))
-            .map(|leaf| leaf.capsule_id.clone())
-            .collect()
     }
 }
 

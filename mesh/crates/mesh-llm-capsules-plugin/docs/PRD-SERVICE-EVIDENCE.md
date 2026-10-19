@@ -60,7 +60,7 @@ Each member is separately declared and separately verifiable:
   serves for that subject and anchor;
 - optionally `served_summary/1` (**built**: per-model served counts and latency
   over the checkpointed range, "fewer than 5" below a floor of 5,
-  `mesh/crates/mesh-llm-capsules-plugin/src/served_summary.rs`; not in -00's registry);
+  evidencebook's `served_summary` fold, labelled in `mesh/crates/mesh-llm-capsules-plugin/src/evidence_answer.rs`; not in -00's registry);
 - witness receipt status;
 - peer-confirmed exchange halves;
 - referee verdicts;
