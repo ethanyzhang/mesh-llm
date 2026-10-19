@@ -95,6 +95,7 @@
 use cll::mmr::leaf_count;
 use ed25519_dalek::SigningKey;
 use evidence_request::digest::request_digest;
+use evidence_request::envelope::Binding;
 use evidence_request::refusal;
 use evidence_request::registry::Reason;
 use evidence_request::request::{self, Coverage, Derivation, Request, Subject};
@@ -103,10 +104,15 @@ use evidence_request::time::parse_utc;
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
-use crate::evidence_artifact::{self, Build, CheckError, ReceiptStatus};
+use evidencebook::answer::{self as book_answer, AnswerError, Options, Selection};
+use evidencebook::received::{self, Appended, ReceivedLog, MAX_RECEIVED_LOG_BYTES};
+use evidencebook::served_summary::{self, DERIVATION as SERVED_SUMMARY_DERIVATION_TOKEN};
+use evidencebook::store::CheckpointedLog;
+use evidencebook::substrate::StatedCheckpoint;
+
+use crate::evidence_artifact::{self, CheckError, ReceiptStatus, WITNESS_RECEIPTS};
 use crate::evidence_log::{self, LedgerIndex, LogView};
 use crate::requester_auth::{self, Form, Principal};
-use crate::served_summary::SERVED_SUMMARY_DERIVATION_TOKEN;
 
 /// The largest request answered. A -00 request is a few hundred bytes; this
 /// turns a large one away before it is parsed.
@@ -462,7 +468,11 @@ fn answer_from(
         Resolution::Artifact(anchor) => anchor,
         Resolution::Refuse(reason) => return Err(reason),
     };
-    let at = serving_position(index, &anchor)?;
+    let stated = view
+        .stated_checkpoints()
+        .map_err(|_| Reason::PolicyDeclined)?;
+    let at = book_answer::serving_checkpoint(view, &stated, &anchor)
+        .map_err(|_| Reason::CoverageUnsatisfiable)?;
     let served_summary = matches!(&req.derivation,
         Some(Derivation::Token(t)) if t == SERVED_SUMMARY_DERIVATION_TOKEN);
     if served_summary {
@@ -530,46 +540,146 @@ fn answer_from(
     }
 
     // 10. Build and sign.
-    evidence_artifact::build(
-        &Build {
-            request: req,
-            request_bytes,
-            resolved: &anchor,
-            at,
-            records: &records,
-            signing_key: responder.signing_key,
-            issued_at: responder.now,
-        },
+    reply(
+        req,
+        request_bytes,
+        &anchor,
+        Selection { at, records },
+        responder,
         view,
     )
 }
 
-/// The chain position of the checkpoint an answer is served under. For an
-/// anchor, the checkpoint it names. For an `exchange` subject pinned by the
-/// requester's own half, the earliest checkpoint covering the last record
-/// citing the half among those the latest one covers, so growth that adds
-/// no citing record does not change the artifact (-00 §5), as evidencebook
-/// and the Go responder choose it; `coverage_unsatisfiable` when no
-/// checkpoint covers one yet.
-fn serving_position(index: &LedgerIndex, anchor: &ResolvedAnchor) -> Result<usize, Reason> {
-    let covers = |c: &evidence_log::ChainCheckpoint| leaf_count(c.record.mmr_size).unwrap_or(0);
-    match anchor {
-        ResolvedAnchor::Anchor(a) => index
-            .chain
-            .iter()
-            .position(|c| c.anchor_digest() == a.digest),
-        ResolvedAnchor::ExchangeHalf(half) => {
-            let latest = index.chain.last().map_or(0, covers);
-            index
-                .citing(half)
-                .iter()
-                .copied()
-                .filter(|&i| i < latest)
-                .max()
-                .and_then(|last| index.chain.iter().position(|c| covers(c) > last))
+/// The labels this node publishes its served summary under: the Python
+/// reference's `ServedSummary.to_value()` texts.
+const SERVED_SUMMARY_LABELS: served_summary::Labels<'static> = served_summary::Labels {
+    schema: "mesh-served-summary/1",
+    // The digest of the fold's definition document, `mesh.served_summary_fold/1`
+    // (`served_summary.MESH_SERVED_SUMMARY_DEFINITION_DIGEST`: SHA-256 over the
+    // RFC 8785 bytes of the account definition). A fixed document, so a fixed
+    // digest; it moves only if the definition's reads or class change.
+    definition_digest: "6eb6f1870dbcee613573c60692b79ab979e2a6188a0f4c6191d4af65a7b773b8",
+    groups_member: "by_model",
+    digest_member: "weights_digest",
+    variants_member: "quantizations",
+    refused_note: "agent_action_capsule.contracts.EFFECT_STATUSES carries no distinct 'refused' value; a \
+     pre-dispatch policy refusal is coarsened to effect.status='failed' before this module sees \
+     it (mesh_record_emitter.py's policy_denied terminal state) -- refused is always 0 until a \
+     status value distinguishes it, never inferred from other fields",
+    digest_absent_note: "no capsule field named weights_digest exists in records this sidecar emits today \
+     (same absence self_accountability.rung_summary documents) -- never fabricated",
+    selection_note: "witnessed range only: entries appended after the latest witnessed \
+                     checkpoint are excluded by design, same as account_capsule.py",
+    derivation_note: "counts + latency distribution per model, over the selected witnessed \
+                     range; an ACCOUNT of what was served, not a score. The relying party \
+                     computes its own predicate.",
+    coverage_note: "cross-check handle: recompute the fold from the node's ledger, check \
+                     the ledger against this root, confirm the root was witnessed",
+    adjudications_note: "verdicts this node has received() into its own log about its served \
+                     exchanges -- not this node's own judgment of itself. The counterparty-held \
+                     references path (its counterparties asked about it) is what carries weight in an \
+                     adversarial reading; this count is never presented as a substitute for it.",
+    no_requester_identifiers: "this summary reads and reports no requester-identity field \
+             (cross_party.initiator_ref, serving_provenance.requesting_party/counterparty_ref) \
+             -- it answers WHAT was served, never WHO asked",
+    not_a_score: "An account of facts + a witness handle to verify them, not a score or routing \
+             recommendation.",
+};
+
+/// This node's served summary under the checkpoint `at`: every ledger line's
+/// facts, bounded by what `at` covers.
+fn served_summary_value(index: &LedgerIndex, at: &StatedCheckpoint) -> Option<Value> {
+    let covered = at.checkpoint.leaf_count().ok()?;
+    let facts: Vec<_> = index.leaves.iter().map(|l| &l.facts).collect();
+    Some(served_summary::summary_value(
+        &facts,
+        &served_summary::Coverage {
+            checkpoint: &at.checkpoint,
+            covered,
+        },
+        &|id| index.leaf_index_of(id).is_some(),
+        &SERVED_SUMMARY_LABELS,
+    ))
+}
+
+/// Build and sign the answer with evidencebook's builder over the index, and
+/// carry it in the profile's flat reply, with this node's witness receipts
+/// for the checkpoints the answer carries beside the envelope
+/// (`evidence_artifact::WITNESS_RECEIPTS`). A reason when no answer can be
+/// built.
+fn reply(
+    req: &Request,
+    request_bytes: &[u8],
+    anchor: &ResolvedAnchor,
+    selection: Selection,
+    responder: &Responder<'_>,
+    view: &LogView<'_>,
+) -> Result<Value, Reason> {
+    let index = view.index;
+    let derive = |token: &str, subject: &Subject, at: &StatedCheckpoint| {
+        if token == SERVED_SUMMARY_DERIVATION_TOKEN && *subject == Subject::FullHistory {
+            Some((
+                "served_summary".to_string(),
+                served_summary_value(index, at)?,
+            ))
+        } else {
+            None
         }
+    };
+    let signed = book_answer::build(
+        view,
+        view,
+        req,
+        request_bytes,
+        anchor,
+        &selection,
+        Options {
+            prove_beyond_profile: true,
+            derive: Some(&derive),
+        },
+        responder.signing_key,
+        responder.now,
+    )
+    .map_err(|e| match e {
+        AnswerError::AnchorNotFound | AnswerError::CitingNotAnchored => {
+            Reason::CoverageUnsatisfiable
+        }
+        AnswerError::RecordNotFound | AnswerError::NoRecords => Reason::NoSuchSubject,
+        AnswerError::DerivationUnsupported => Reason::DerivationUnsupported,
+        AnswerError::Sign(e) => {
+            tracing::warn!(error = %e, "an evidence answer could not be signed -- declining");
+            Reason::PolicyDeclined
+        }
+        AnswerError::RecordDigest | AnswerError::OverLimit | AnswerError::Substrate(_) => {
+            Reason::PolicyDeclined
+        }
+    })?;
+    let mut wire: Value = serde_json::from_slice(&signed.encode(Binding::Json))
+        .map_err(|_| Reason::PolicyDeclined)?;
+    // The receipts go with the checkpoints the answer carries: the listed
+    // ones for a checkpoint list or a history card, else the serving one.
+    let lists = matches!(req.subject, Subject::Checkpoints)
+        || matches!(&req.derivation,
+            Some(Derivation::Token(t)) if t == evidence_request::registry::DERIVATION_HISTORY_CARD);
+    let carried = if lists {
+        &index.chain[..=selection.at]
+    } else {
+        std::slice::from_ref(&index.chain[selection.at])
+    };
+    let receipts: Vec<Value> = carried
+        .iter()
+        .flat_map(|cp| {
+            let digest = cp.anchor_digest();
+            cp.record
+                .witnesses
+                .iter()
+                .map(move |w| json!({"checkpoint": digest, "witness": w}))
+        })
+        .collect();
+    if !receipts.is_empty() {
+        wire[WITNESS_RECEIPTS] = Value::Array(receipts);
     }
-    .ok_or(Reason::CoverageUnsatisfiable)
+    Ok(wire)
 }
 
 /// Whether some record of this node names `principal`, the node a signed
@@ -627,9 +737,9 @@ pub fn answer_and_log(
     };
     let (status, reason) = outcome.log_status();
     let digest = request_digest(request_bytes);
-    crate::received_log::append(
+    log_received(
         log_dir,
-        &crate::received_log::Entry {
+        &received::Entry {
             ts: responder.now,
             path: "evidence-request",
             requester_id: requester_id.as_deref(),
@@ -645,6 +755,30 @@ pub fn answer_and_log(
         },
     );
     outcome
+}
+
+/// The "asked of you" log for this run (evidencebook's `received`), capped at
+/// `MAX_RECEIVED_LOG_BYTES`.
+static RECEIVED_LOG: ReceivedLog = ReceivedLog::new(MAX_RECEIVED_LOG_BYTES);
+
+/// Append `entry` to the "asked of you" log in `dir` when `dir` is the
+/// directory locked for it at start (`data_dir::received_log_writable`).
+/// Best-effort: an answer is decided before it is logged, so a failure is
+/// reported in this node's own log and never changes it. A full log is
+/// reported on its first drop, then every 1000th.
+pub(crate) fn log_received(dir: Option<&Path>, entry: &received::Entry<'_>) {
+    let dir = dir.filter(|d| crate::data_dir::received_log_writable(d));
+    match RECEIVED_LOG.append(dir, entry) {
+        Ok(Appended::Full { dropped }) if dropped == 1 || dropped.is_multiple_of(1000) => {
+            tracing::warn!(
+                dropped,
+                max_bytes = MAX_RECEIVED_LOG_BYTES,
+                "the received log is full; requests are no longer logged"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not append to the received log"),
+    }
 }
 
 /// Now, as every `issued_at` is written.
@@ -1712,8 +1846,7 @@ mod tests {
         };
         let outcome = answer_and_log(&unbound, false, &responder, Some(log.path()));
         assert!(matches!(outcome, Outcome::Answered { .. }));
-        let text = std::fs::read_to_string(log.path().join(crate::received_log::RECEIVED_LOG_FILE))
-            .unwrap();
+        let text = std::fs::read_to_string(log.path().join(received::RECEIVED_LOG_FILE)).unwrap();
         let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(line["principal_key_id"], json!(key_id_of(&stranger)));
         assert_eq!(line["principal_binding"], json!("unbound"));
@@ -1778,8 +1911,7 @@ mod tests {
             expected,
             "answered as unsigned, not refused"
         );
-        let text = std::fs::read_to_string(log.path().join(crate::received_log::RECEIVED_LOG_FILE))
-            .unwrap();
+        let text = std::fs::read_to_string(log.path().join(received::RECEIVED_LOG_FILE)).unwrap();
         let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(line["principal_key_id"], json!(key_id_of(&stranger)));
         assert_eq!(line["principal_binding"], json!("unbound"));
@@ -2331,7 +2463,7 @@ mod tests {
             answer_and_log(bytes, false, &responder, Some(log.path()));
         }
         let lines: Vec<Value> =
-            std::fs::read_to_string(log.path().join(crate::received_log::RECEIVED_LOG_FILE))
+            std::fs::read_to_string(log.path().join(received::RECEIVED_LOG_FILE))
                 .unwrap()
                 .lines()
                 .map(|l| serde_json::from_str(l).unwrap())
@@ -2353,5 +2485,90 @@ mod tests {
             assert_eq!(line["status"], json!(status), "{line}");
         }
         assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn a_received_line_is_what_the_evidence_page_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = received::Entry {
+            ts: NOW,
+            path: "evidence-request",
+            requester_id: Some("node-a"),
+            subject_kind: Some("record"),
+            status: "refused",
+            reason: Some("no_such_subject"),
+            request_digest: Some("ab"),
+            principal_key_id: Some("cd"),
+            principal_node_id: Some("node-a"),
+            principal_binding: Some("bound"),
+            audience: Some("node-r"),
+            replay: Some("checked"),
+        };
+        log_received(Some(dir.path()), &entry);
+        log_received(Some(&dir.path().join("missing")), &entry);
+        assert_eq!(
+            crate::evidence_panes::read_received_log(dir.path()),
+            vec![entry.to_json()]
+        );
+        assert!(!dir.path().join("missing").exists());
+    }
+
+    /// The served summary keeps the reference's published form: its schema,
+    /// `by_model`, `weights_digest` and `quantizations` members and texts.
+    #[test]
+    fn the_served_summary_is_published_under_the_references_labels() {
+        let facts: Vec<_> = (0..7)
+            .map(|i| evidencebook::served_summary::LeafFacts {
+                served: Some(evidencebook::served_summary::ServedFacts {
+                    group: "m".into(),
+                    variant: "q4".into(),
+                    outcome: if i == 0 {
+                        evidencebook::served_summary::Outcome::Failed
+                    } else {
+                        evidencebook::served_summary::Outcome::Completed
+                    },
+                    latency_ms: Some(i as f64),
+                    digest_present: false,
+                }),
+                adjudicated_halves: None,
+            })
+            .collect();
+        let refs: Vec<_> = facts.iter().collect();
+        let cp = evidencebook::substrate::Checkpoint {
+            v: 1,
+            kind: "mmr_checkpoint".into(),
+            log_id: "log".into(),
+            mmr_size: 1,
+            root: "ab".into(),
+            prev_size: 0,
+            prev_root: String::new(),
+            key_id: "0123456789abcdef0123".into(),
+            timestamp: NOW.into(),
+            signature: String::new(),
+            witnesses: Vec::new(),
+        };
+        let v = served_summary::summary_value(
+            &refs,
+            &served_summary::Coverage {
+                checkpoint: &cp,
+                covered: 6,
+            },
+            &|_| false,
+            &SERVED_SUMMARY_LABELS,
+        );
+        assert_eq!(v["schema"], json!("mesh-served-summary/1"));
+        let m = &v["derivation"]["by_model"]["m"];
+        assert_eq!(m["served"], json!(6));
+        assert_eq!(m["latency_max_ms"], json!("5.000"));
+        assert_eq!(m["quantizations"], json!(["q4"]));
+        assert!(m["weights_digest"]["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("no capsule field named weights_digest exists in records this sidecar emits today (same"));
+        assert_eq!(
+            v["derivation"]["definition_digest"],
+            json!("6eb6f1870dbcee613573c60692b79ab979e2a6188a0f4c6191d4af65a7b773b8")
+        );
+        assert_eq!(v["node_id"], json!("node:0123456789abcdef"));
     }
 }

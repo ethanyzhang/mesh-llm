@@ -3084,6 +3084,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "evidencebook"
+version = "0.0.5"
+dependencies = [
+ "checkpointed-local-log",
+ "ed25519-dalek 2.2.0",
+ "evidence-request",
+ "hex",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5050,6 +5065,7 @@ dependencies = [
  "coset",
  "ed25519-dalek 2.2.0",
  "evidence-request",
+ "evidencebook",
  "hex",
  "libc",
  "mesh-llm-plugin",

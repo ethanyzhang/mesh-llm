@@ -60,7 +60,11 @@ use evidence_request::resolve::{Anchor, Responder};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::served_summary::{LeafFacts, SERVED_SUMMARY_DERIVATION_TOKEN};
+use evidencebook::served_summary::{self, LeafFacts, Outcome, ServedFacts};
+use evidencebook::store::{CheckpointedLog, RecordSource};
+use evidencebook::substrate::{Checkpoint, StatedCheckpoint, SubstrateError};
+
+pub use evidencebook::store::Record;
 
 pub const CAPSULES_FILE: &str = "capsules.jsonl";
 pub const CHECKPOINTS_FILE: &str = "checkpoints.jsonl";
@@ -184,7 +188,7 @@ impl Tail {
 
 /// What a consistency proof is made of: the old peaks, each one's path into
 /// the new MMR, and the new peaks.
-pub type ConsistencyParts = (Vec<Hash>, Vec<Vec<Hash>>, Vec<Hash>);
+pub use evidencebook::store::ConsistencyParts;
 
 /// One checkpoint of the chain, with its COSE wire statement.
 #[derive(Clone, Debug)]
@@ -308,7 +312,7 @@ impl LedgerIndex {
                     .pointer("/model_attestation/compute_attestation")
                     .and_then(|c| c.get(crate::producer::capsule::OWNER_MAINTENANCE_BLOCK))
                     .is_some(),
-            facts: LeafFacts::of(&record),
+            facts: leaf_facts(&record),
         });
         Ok(())
     }
@@ -504,17 +508,6 @@ impl LogView<'_> {
     }
 }
 
-/// One record, as an answer serves it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Record {
-    /// 0-based position in the log.
-    pub leaf_index: u64,
-    /// The `capsule_id`, the entry the log commits.
-    pub digest: String,
-    /// The record's line in the ledger.
-    pub body: Vec<u8>,
-}
-
 /// A record's digest as a requester computes it from the body it was sent:
 /// the body's recomputed `capsule_id`, when that is the id the body states.
 /// `None` for a body that is not a record of this format.
@@ -575,11 +568,157 @@ impl Responder for LogView<'_> {
             Derivation::Token(t) if t == DERIVATION_HISTORY_CARD => {
                 Some(vec![SubjectForm::FullHistory, SubjectForm::Checkpoints])
             }
-            Derivation::Token(t) if t == SERVED_SUMMARY_DERIVATION_TOKEN => {
+            Derivation::Token(t) if t == served_summary::DERIVATION => {
                 Some(vec![SubjectForm::FullHistory])
             }
             _ => None,
         }
+    }
+}
+
+/// The record side of this node's store, for the evidencebook answer: a
+/// record's committed entry is its `capsule_id`, and its body is its ledger
+/// line. Padding is a leaf, read by position, but never found by id.
+impl RecordSource for LogView<'_> {
+    fn record_by_digest(&self, digest: &str) -> Option<Record> {
+        self.record_at(self.index.leaf_index_of(digest)?)
+    }
+    fn record_at(&self, leaf_index: u64) -> Option<Record> {
+        LogView::record_at(self, leaf_index)
+    }
+    fn leaf_index_of(&self, digest: &str) -> Option<u64> {
+        self.index.leaf_index_of(digest)
+    }
+    fn correlation(&self, id: &str) -> Vec<String> {
+        self.capsule_ids(self.index.correlated(id))
+    }
+    fn citing(&self, half_digest: &str) -> Vec<String> {
+        self.capsule_ids(self.index.citing(half_digest))
+    }
+    /// The body's recomputed `capsule_id`, or, for a body that is not a
+    /// record of this format, its SHA-256: the two digests this node's
+    /// requester accepts for a record (`evidence_artifact`).
+    fn entry_of(&self, body: &[u8]) -> Option<String> {
+        record_digest(body).or_else(|| Some(hex::encode(Sha256::digest(body))))
+    }
+}
+
+impl LogView<'_> {
+    fn capsule_ids(&self, leaves: &[u64]) -> Vec<String> {
+        leaves
+            .iter()
+            .filter_map(|&i| self.index.leaves.get(usize::try_from(i).ok()?))
+            .map(|leaf| leaf.capsule_id.clone())
+            .collect()
+    }
+}
+
+/// The commitment side: the chain this index re-derived and its own MMR,
+/// never the checkpointer's node store.
+impl CheckpointedLog for LogView<'_> {
+    fn leaf_count(&self) -> Result<u64, SubstrateError> {
+        Ok(self.index.leaves.len() as u64)
+    }
+    fn stated_checkpoints(&self) -> Result<Vec<StatedCheckpoint>, SubstrateError> {
+        self.index
+            .chain
+            .iter()
+            .map(|cp| {
+                Ok(StatedCheckpoint {
+                    checkpoint: book_checkpoint(&cp.record)?,
+                    statement: cp.statement.clone(),
+                })
+            })
+            .collect()
+    }
+    fn inclusion_path(
+        &self,
+        leaf_index: u64,
+        mmr_size: u64,
+    ) -> Result<Vec<[u8; 32]>, SubstrateError> {
+        self.index
+            .inclusion_path(leaf_index, mmr_size)
+            .ok_or_else(|| {
+                SubstrateError::Mmr(format!(
+                    "no inclusion path for leaf {leaf_index} at size {mmr_size}"
+                ))
+            })
+    }
+    fn consistency_parts(&self, from: u64, to: u64) -> Result<ConsistencyParts, SubstrateError> {
+        self.index
+            .consistency_parts(from, to)
+            .ok_or_else(|| SubstrateError::Mmr(format!("no consistency proof from {from} to {to}")))
+    }
+}
+
+/// The log's checkpoint record in evidencebook's form: the same fields and
+/// wire shape (evidencebook's `wire_shapes_match_the_logs_own_records`).
+pub fn book_checkpoint(record: &CheckpointRecord) -> Result<Checkpoint, SubstrateError> {
+    serde_json::to_value(record)
+        .and_then(serde_json::from_value)
+        .map_err(|e| SubstrateError::Checkpoint(e.to_string()))
+}
+
+/// The served summary's facts about one ledger line: from the `x-mesh-poc-v1`
+/// block `latency_ms`, `serving_provenance.model_canonical_ref` (the group),
+/// `.quantization` (the variant) and `.weights_digest`, `effect.status`, and
+/// the record's role. Only records this node served are counted
+/// (`evidence_panes::label_role`), and padding never is. No
+/// requester-identity field is read.
+pub fn leaf_facts(record: &Value) -> LeafFacts {
+    if crate::producer::padding::is_padding(record) {
+        return LeafFacts::default();
+    }
+    let served = (crate::evidence_panes::label_role(record) == "served").then(|| {
+        let poc = record.pointer("/model_attestation/compute_attestation/x-mesh-poc-v1");
+        let provenance = poc.and_then(|p| p.get("serving_provenance"));
+        let text_or_unknown = |key: &str| {
+            provenance
+                .and_then(|sp| sp.get(key))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("unknown")
+                .to_string()
+        };
+        ServedFacts {
+            group: text_or_unknown("model_canonical_ref"),
+            variant: text_or_unknown("quantization"),
+            outcome: match record.pointer("/effect/status").and_then(Value::as_str) {
+                Some("confirmed") => Outcome::Completed,
+                Some("failed" | "reverted") => Outcome::Failed,
+                _ => Outcome::Unknown,
+            },
+            latency_ms: poc
+                .and_then(|p| p.get("latency_ms"))
+                .and_then(served_summary::latency),
+            digest_present: provenance
+                .and_then(|sp| sp.get("weights_digest"))
+                .is_some_and(|w| !w.is_null()),
+        }
+    });
+    let adjudicated_halves = crate::producer::capsule::is_adjudication(record)
+        .then(|| record.pointer("/model_attestation/compute_attestation/adjudication"))
+        .flatten()
+        .filter(|a| is_truthy(a))
+        .map(|a| {
+            let half = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_string);
+            (half("half_a_capsule_id"), half("half_b_capsule_id"))
+        });
+    LeafFacts {
+        served,
+        adjudicated_halves,
+    }
+}
+
+/// Python truthiness of a JSON value, as `if not adjudication` reads it.
+fn is_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
     }
 }
 
@@ -813,5 +952,49 @@ mod tests {
             record_digest(&view.record_at(9).unwrap().body).as_deref(),
             Some(padding_id)
         );
+    }
+
+    #[test]
+    fn a_verdict_is_read_whether_it_writes_confirms_or_the_legacy_adjudicates() {
+        for relation in ["confirms", "adjudicates"] {
+            let record = json!({"chain": {"relation": relation},
+                "model_attestation": {"compute_attestation": {"epistemic_type": "adjudication",
+                    "adjudication": {"half_a_capsule_id": "a", "half_b_capsule_id": "b"}}}});
+            assert_eq!(
+                leaf_facts(&record).adjudicated_halves,
+                Some((Some("a".into()), Some("b".into()))),
+                "{relation}"
+            );
+        }
+        let plain = json!({"chain": {"relation": "confirms"},
+            "model_attestation": {"compute_attestation": {"adjudication": {"half_a_capsule_id": "a"}}}});
+        assert_eq!(leaf_facts(&plain).adjudicated_halves, None);
+    }
+
+    #[test]
+    fn a_served_record_is_grouped_by_its_model_and_never_reads_who_asked() {
+        let record = json!({
+            "capsule_id": "c",
+            "effect": {"status": "reverted"},
+            "model_attestation": {"compute_attestation": {"x-mesh-poc-v1": {
+                "role": "served", "latency_ms": "10.5",
+                "serving_provenance": {"model_canonical_ref": "m", "quantization": "q4",
+                                       "weights_digest": "w", "requesting_party": "someone"}
+            }}}
+        });
+        let facts = leaf_facts(&record).served.unwrap();
+        assert_eq!(
+            facts,
+            ServedFacts {
+                group: "m".into(),
+                variant: "q4".into(),
+                outcome: Outcome::Failed,
+                latency_ms: Some(10.5),
+                digest_present: true,
+            }
+        );
+        assert!(leaf_facts(&json!({"record_type": "padding"}))
+            .served
+            .is_none());
     }
 }

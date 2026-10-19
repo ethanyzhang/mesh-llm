@@ -1,17 +1,15 @@
 //! The artifact response in the interop profile's form (`evidence-interop/0`,
-//! agent-action-capsule `spec/interop-profile-v0.md` §6.2): this node builds
-//! one from its ledger index ([`build`]) and checks one a peer sent
-//! ([`check`]).
+//! agent-action-capsule `spec/interop-profile-v0.md` §6.2): this node checks
+//! one a peer sent ([`check`]). This node builds its own with evidencebook's
+//! builder (`evidencebook::answer::build`) over its read-only index
+//! (`evidence_log`, which implements the crate's store traits), in
+//! evidencebook's (and the Go responder's) artifact forms, sending the
+//! material below beyond the profile (`Options::prove_beyond_profile`).
 //!
-//! The envelope is the `evidence-request` crate's (`envelope::sign`,
-//! `envelope::parse_reply`, `Envelope::verify_for`), and so is the profile's
-//! check of a record's Checkpointed Local Log material
-//! (`cll_material::check_anchor_inclusion`). Building the artifact is the
-//! responder's business, not that crate's. evidencebook has a builder, but
-//! over its own `CllSubstrate`, which opens the durable node store this
-//! plugin's checkpointer owns: so the builder is here, over the read-only
-//! index (`evidence_log`), in evidencebook's (and the Go responder's)
-//! artifact forms:
+//! The envelope is the `evidence-request` crate's (`envelope::parse_reply`,
+//! `Envelope::verify_for`), and so is the profile's check of a record's
+//! Checkpointed Local Log material (`cll_material::check_anchor_inclusion`).
+//! The forms checked:
 //!
 //! - `record`, no derivation: the record's line in the ledger, proven by the
 //!   anchor's `cll-checkpoint`, its `cll-inclusion-proof` and, when the
@@ -56,21 +54,16 @@ use cll::checkpoint::{verify_checkpoint_cose_offline, DecodedCheckpointCose, Wit
 use cll::mmr::{height_at, interior_hash, leaf_count, leaf_hash, pos_to_leaf_index, Hash};
 use ed25519_dalek::VerifyingKey;
 use evidence_request::cll_material::{
-    self, encode_consistency_proof, encode_inclusion_proof, KeyDecision, LogKeyPolicy,
-    KIND_CHECKPOINT, KIND_CONSISTENCY, KIND_INCLUSION,
+    self, KeyDecision, LogKeyPolicy, KIND_CHECKPOINT, KIND_CONSISTENCY, KIND_INCLUSION,
 };
-use evidence_request::envelope::{
-    self, subject_value, Anchor, AnchorFreshness, Binding, Envelope, EnvelopeParts, Reply,
-};
-use evidence_request::registry::{Reason, DERIVATION_HISTORY_CARD};
+use evidence_request::envelope::{self, subject_value, AnchorFreshness, Binding, Envelope, Reply};
+use evidence_request::registry::DERIVATION_HISTORY_CARD;
 use evidence_request::request::{Coverage, Derivation, Freshness, Request, Subject};
-use evidence_request::resolve::ResolvedAnchor;
 use evidence_request::time::parse_utc;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::evidence_log::{ChainCheckpoint, LogView, Record};
-use crate::served_summary::SERVED_SUMMARY_DERIVATION_TOKEN;
+use evidencebook::served_summary::DERIVATION as SERVED_SUMMARY_DERIVATION_TOKEN;
 
 /// The reply member that carries witness receipts beside the envelope.
 pub const WITNESS_RECEIPTS: &str = "witness_receipts";
@@ -90,228 +83,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-// ---------------------------------------------------------------------------
-// The responder's side.
-// ---------------------------------------------------------------------------
-
-/// What an answer is built from, once the request is resolved and the
-/// sharing policy has passed it.
-pub struct Build<'a> {
-    pub request: &'a Request,
-    /// The request's octets as received.
-    pub request_bytes: &'a [u8],
-    /// The anchor as `resolve::resolve` resolved it: what the envelope names.
-    pub resolved: &'a ResolvedAnchor,
-    /// The chain position of the checkpoint the answer is served under
-    /// (a stated one).
-    pub at: usize,
-    /// The leaf indices of the records the answer carries, ascending, all
-    /// under that checkpoint. Empty for a checkpoint list or a derivation.
-    pub records: &'a [u64],
-    pub signing_key: &'a ed25519_dalek::SigningKey,
-    pub issued_at: &'a str,
-}
-
-/// Build and sign the answer: the profile's flat reply, carried in a JSON
-/// frame, with this node's witness receipts beside the envelope. A reason when no answer can
-/// be built.
-pub fn build(b: &Build<'_>, view: &LogView<'_>) -> Result<Value, Reason> {
-    let index = view.index;
-    let served = index.chain.get(b.at).ok_or(Reason::CoverageUnsatisfiable)?;
-    let statement = &served.statement;
-    let anchor_digest = served.anchor_digest();
-    // The checkpoints up to the serving one: a checkpoint list and a history
-    // card.
-    let listed: Vec<&ChainCheckpoint> = index.chain[..=b.at].iter().collect();
-
-    let mut head = Map::new();
-    head.insert("anchor".into(), json!(anchor_digest));
-    head.insert("evidence_stream".into(), json!(served.record.log_id));
-    head.insert("subject".into(), subject_value(&b.request.subject));
-    let mut material: Vec<(String, Vec<u8>)> = Vec::new();
-    // The checkpoints whose receipts go with the answer.
-    let mut carried: Vec<&ChainCheckpoint> = vec![served];
-
-    let artifact = match (&b.request.derivation, &b.request.subject) {
-        (Some(Derivation::Token(t)), _) if t == DERIVATION_HISTORY_CARD => {
-            let mut history = Vec::with_capacity(listed.len());
-            for (i, cp) in listed.iter().enumerate() {
-                // The chain grows strictly, so every checkpoint after the
-                // first extends the one before it by a proof.
-                let consistency = match i.checked_sub(1).map(|p| listed[p]) {
-                    Some(prev) => json!(hex::encode(consistency(
-                        view,
-                        prev.record.mmr_size,
-                        cp.record.mmr_size
-                    )?)),
-                    None => Value::Null,
-                };
-                history.push(json!({
-                    "checkpoint": hex::encode(&cp.statement),
-                    "consistency_from_previous": consistency,
-                }));
-            }
-            head.insert("derivation".into(), json!(DERIVATION_HISTORY_CARD));
-            head.insert("history".into(), Value::Array(history));
-            carried = listed.clone();
-            jcs(head)?
-        }
-        (Some(Derivation::Token(t)), Subject::FullHistory)
-            if t == SERVED_SUMMARY_DERIVATION_TOKEN =>
-        {
-            let covered =
-                leaf_count(served.record.mmr_size).map_err(|_| Reason::CoverageUnsatisfiable)?;
-            let facts: Vec<_> = index.leaves.iter().map(|l| &l.facts).collect();
-            let summary = crate::served_summary::summary_value(
-                &facts,
-                &crate::served_summary::Coverage {
-                    checkpoint: &served.record,
-                    covered,
-                },
-                &|id| index.leaf_index_of(id).is_some(),
-            );
-            head.insert("derivation".into(), json!(SERVED_SUMMARY_DERIVATION_TOKEN));
-            head.insert("served_summary".into(), summary);
-            material.push((KIND_CHECKPOINT.into(), statement.clone()));
-            jcs(head)?
-        }
-        (Some(_), _) => return Err(Reason::DerivationUnsupported),
-        (None, Subject::Checkpoints) => {
-            let list = listed
-                .iter()
-                .map(|cp| json!(hex::encode(&cp.statement)))
-                .collect();
-            head.insert("checkpoints".into(), Value::Array(list));
-            carried = listed.clone();
-            jcs(head)?
-        }
-        (None, Subject::Record(digest)) => {
-            let [leaf] = b.records else {
-                return Err(Reason::NoSuchSubject);
-            };
-            let record = view
-                .record_at(*leaf)
-                .filter(|r| r.digest == *digest)
-                .ok_or(Reason::NoSuchSubject)?;
-            material.push((KIND_CHECKPOINT.into(), statement.clone()));
-            material.push((
-                KIND_INCLUSION.into(),
-                inclusion(view, record.leaf_index, served.record.mmr_size)?,
-            ));
-            if served.record.prev_size > 0 {
-                material.push((
-                    KIND_CONSISTENCY.into(),
-                    consistency(view, served.record.prev_size, served.record.mmr_size)?,
-                ));
-            }
-            record.body
-        }
-        (None, _) => {
-            if b.records.is_empty() {
-                return Err(Reason::NoSuchSubject);
-            }
-            let records = b
-                .records
-                .iter()
-                .map(|&i| view.record_at(i).ok_or(Reason::NoSuchSubject))
-                .collect::<Result<Vec<Record>, _>>()?;
-            material.push((KIND_CHECKPOINT.into(), statement.clone()));
-            for r in &records {
-                material.push((
-                    KIND_INCLUSION.into(),
-                    inclusion(view, r.leaf_index, served.record.mmr_size)?,
-                ));
-            }
-            head.insert(
-                "records".into(),
-                Value::Array(
-                    records
-                        .iter()
-                        .map(|r| json!({"body": hex::encode(&r.body), "digest": r.digest, "leaf_index": r.leaf_index}))
-                        .collect(),
-                ),
-            );
-            jcs(head)?
-        }
-    };
-
-    let freshness = match &b.request.coverage {
-        Coverage::MinFreshness(Freshness::Size(_)) => {
-            Some(AnchorFreshness::Size(served.record.mmr_size))
-        }
-        Coverage::MinFreshness(Freshness::Time(_)) => Some(AnchorFreshness::Time(profile_time(
-            &served.record.timestamp,
-        ))),
-        Coverage::ExpectedPin(_) => None,
-    };
-    let signed = envelope::sign(
-        b.request_bytes,
-        EnvelopeParts {
-            subject: b.request.subject.clone(),
-            derivation: b.request.derivation.clone(),
-            // Under a half pin the envelope names the pin, the requester's
-            // own half (profile §7.1 anchor_match), as evidencebook and the
-            // Go responder do; the artifact names the serving checkpoint.
-            anchor: Anchor {
-                digest: b.resolved.digest().to_string(),
-                freshness,
-            },
-            artifact,
-            verification: material,
-            issued_at: b.issued_at.to_string(),
-        },
-        b.signing_key,
-    )
-    .map_err(|e| {
-        tracing::warn!(error = %e, "an evidence answer could not be signed -- declining");
-        Reason::PolicyDeclined
-    })?;
-    let mut reply: Value = serde_json::from_slice(&signed.encode(Binding::Json))
-        .map_err(|_| Reason::PolicyDeclined)?;
-    let receipts: Vec<Value> = carried
-        .iter()
-        .flat_map(|cp| {
-            let digest = cp.anchor_digest();
-            cp.record
-                .witnesses
-                .iter()
-                .map(move |w| json!({"checkpoint": digest, "witness": w}))
-        })
-        .collect();
-    if !receipts.is_empty() {
-        reply[WITNESS_RECEIPTS] = Value::Array(receipts);
-    }
-    Ok(reply)
-}
-
 /// A checkpoint time in the profile's form: UTC, any fraction dropped
-/// (profile §5.2).
+/// (profile §5.2), as the responder states its freshness.
 fn profile_time(timestamp: &str) -> String {
     match timestamp.split_once('.') {
         Some((seconds, _)) => format!("{seconds}Z"),
         None => timestamp.to_string(),
     }
-}
-
-fn jcs(object: Map<String, Value>) -> Result<Vec<u8>, Reason> {
-    evidence_request::jcs::to_string(&Value::Object(object))
-        .map(String::into_bytes)
-        .map_err(|_| Reason::PolicyDeclined)
-}
-
-fn inclusion(view: &LogView<'_>, leaf: u64, size: u64) -> Result<Vec<u8>, Reason> {
-    view.index
-        .inclusion_path(leaf, size)
-        .and_then(|path| encode_inclusion_proof(leaf, &path))
-        .ok_or(Reason::PolicyDeclined)
-}
-
-fn consistency(view: &LogView<'_>, from: u64, to: u64) -> Result<Vec<u8>, Reason> {
-    let (old, paths, new) = view
-        .index
-        .consistency_parts(from, to)
-        .ok_or(Reason::PolicyDeclined)?;
-    encode_consistency_proof(from, to, &old, &paths, &new).ok_or(Reason::PolicyDeclined)
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,7 +850,11 @@ mod tests {
         announced_keys, corpus_ledger, corpus_ledger_dir, NODE_KEY_SEED, RESPONDER_NODE,
     };
     use ed25519_dalek::SigningKey;
+    use evidence_request::cll_material::encode_inclusion_proof;
+    use evidence_request::envelope::EnvelopeParts;
+    use evidence_request::registry::Reason;
     use evidence_request::request;
+    use serde_json::json;
 
     const NOW: &str = "2026-09-29T00:00:00Z";
 

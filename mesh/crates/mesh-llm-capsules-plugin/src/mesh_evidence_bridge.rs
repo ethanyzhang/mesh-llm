@@ -20,7 +20,7 @@
 //! artifact or a signed refusal. At most [`MAX_IN_FLIGHT_ANSWERS`] requests
 //! are answered at once; one more is declined with a signed
 //! `policy_declined` before the ledger is read. Every answer is logged to
-//! the "asked of you" log (`received_log`).
+//! the "asked of you" log (`evidence_answer::log_received`).
 //!
 //! An `adjudicate` request (a requester asking this node to referee two
 //! twins) is not a -00 subject: it is plugin-internal, carried on the same

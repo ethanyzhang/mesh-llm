@@ -45,12 +45,17 @@
     nothing: the anchor's statement and one inclusion proof per record for a record set, and the
     witness receipts of the checkpoints it carries in a `witness_receipts` member beside the
     envelope. The requester checks all of it as before.
-  - The builder stays in the plugin (`evidence_artifact`): evidencebook's builder works over its
-    own `CllSubstrate`, which would open the node store the checkpointer owns.
+  - The answer is built by evidencebook's builder (`evidencebook::answer::build`) over this node's
+    read-only index, which implements the crate's store traits (evidencebook#35), so the crate
+    never opens the node store the checkpointer owns. The citing-records anchor rule, the
+    served-summary fold and the "asked of you" log are evidencebook's too; this plugin keeps its
+    own limits, sharing-policy gate, requester checks, the served summary's published labels and
+    the checkpoint cadence. The answers are unchanged: the AAC evidence-request parity run passes
+    before and after.
   - A `served_summary/1` answer's verification now reports `records: []`, like every other
     answer, not `0`.
-- **`capsule-emit` 0.0.8 and `checkpointed-local-log` 0.3.1**, one CLL line in the build, and no
-  `evidencebook`. capsule-emit 0.0.8 turns on `serde_json`'s `arbitrary_precision` for the whole
+- **`capsule-emit` 0.0.8, `checkpointed-local-log` 0.3.1 and `evidencebook`**, one CLL line and
+  one `evidence-request` line in the build. capsule-emit 0.0.8 turns on `serde_json`'s `arbitrary_precision` for the whole
   binary; the strict parser for pushed bodies (`strict_json`) now reads numbers in that form, still
   refuses a float that overflows, and refuses a key that spells `serde_json`'s private number
   token.

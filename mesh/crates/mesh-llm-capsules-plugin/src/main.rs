@@ -29,7 +29,6 @@ mod peer_keys;
 mod peer_root_ledger;
 #[allow(dead_code)]
 mod producer;
-mod received_log;
 mod record_push_bridge;
 #[cfg(test)]
 mod record_push_parity;
@@ -39,7 +38,6 @@ mod requester_auth;
 mod routing_choice_bridge;
 mod routing_rule;
 mod self_peer;
-mod served_summary;
 mod settings;
 mod settlement_channel;
 mod settlement_legs;

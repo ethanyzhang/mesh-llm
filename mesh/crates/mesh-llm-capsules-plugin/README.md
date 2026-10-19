@@ -91,9 +91,10 @@ directory.
 | `gates/` | the mutant table the plugin's own CI gates read |
 
 The records are sealed by the [`capsule-emit`](https://crates.io/crates/capsule-emit)
-crate on top of [`checkpointed-local-log`](https://crates.io/crates/checkpointed-local-log)
-and [`evidencebook`](https://crates.io/crates/evidencebook); those crates are
-developed and tested in their own repositories.
+crate on top of [`checkpointed-local-log`](https://crates.io/crates/checkpointed-local-log),
+and evidence answers are built on [`evidencebook`](https://crates.io/crates/evidencebook)
+over this plugin's own ledger index; those crates are developed and tested in
+their own repositories.
 
 ## Contributing
 
