@@ -137,11 +137,3 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
-
-# The capsules plugin builds on the evidencebook crate's store traits
-# (evidencebook#35), which are not on crates.io yet. This proving branch takes
-# the crate from a local checkout; the pin moves to the crates.io release
-# before any upstream PR (mesh-llm allows no git or path sources there).
-[patch.crates-io]
-evidencebook = { path = "/Users/ezhang/Github/evidencebook/rust/evidencebook" }
-

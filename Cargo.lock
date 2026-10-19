@@ -3085,7 +3085,9 @@ dependencies = [
 
 [[package]]
 name = "evidencebook"
-version = "0.0.5"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b8a06ee7c3aaa67605e8d6681031bce369f61f06a58c94fd197b627f804aa39"
 dependencies = [
  "checkpointed-local-log",
  "ed25519-dalek 2.2.0",
