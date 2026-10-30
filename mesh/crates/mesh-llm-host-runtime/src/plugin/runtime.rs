@@ -38,6 +38,9 @@ mod restart_tests;
 mod settings_tests;
 mod shutdown;
 mod socket_auth;
+mod start_announce;
+#[cfg(test)]
+mod start_announce_tests;
 pub(crate) mod status_publication;
 
 use self::default_plugin_policy::restrict_default_plugin;
@@ -63,6 +66,13 @@ pub(crate) struct ExternalPlugin {
     runtime_data_producer: RuntimeDataProducer,
     restart_lock: Arc<Mutex<()>>,
     stopping: AtomicBool,
+    /// Set when a node takes this plugin's manager
+    /// ([`Self::expect_mesh_snapshots`]). The node sends every plugin its
+    /// mesh snapshot then, which covers the starts before it; any later start
+    /// (a restart, or a lazy plugin's first start) tells the node, which
+    /// sends that plugin the snapshot again. Without a node (the plugin CLI)
+    /// there is no snapshot to wait for.
+    announce_starts: AtomicBool,
     next_request_id: AtomicU64,
     next_generation: AtomicU64,
     /// Serves this plugin as a task in this process instead of a child.
@@ -71,6 +81,9 @@ pub(crate) struct ExternalPlugin {
 
 pub(crate) struct PluginRuntime {
     pub(crate) generation: u64,
+    /// Its start finished: initialized and, after `spawn`, given the mesh
+    /// snapshot. Only a started runtime takes `ensure_running`'s fast path.
+    pub(crate) started: bool,
     pub(crate) authenticated_peer: bool,
     pub(crate) initialized_lifecycle: Option<Box<proto::OpenAiExchangeHookManifest>>,
     /// What this generation's manifest says about `/api/status`.
@@ -155,18 +168,16 @@ impl ExternalPlugin {
             runtime_data_producer,
             restart_lock: Arc::new(Mutex::new(())),
             stopping: AtomicBool::new(false),
+            announce_starts: AtomicBool::new(false),
             next_request_id: AtomicU64::new(1),
             next_generation: AtomicU64::new(1),
             in_process,
         };
         if spec.startup.lazy_start {
             plugin.mark_deferred().await;
-            return Ok(plugin);
-        }
-        if let Err(err) = plugin.ensure_running().await {
-            if plugin.is_disabled().await {
-                return Ok(plugin);
-            }
+        } else if let Err(err) = plugin.ensure_running().await
+            && !plugin.is_disabled().await
+        {
             return Err(err);
         }
         Ok(plugin)
@@ -329,6 +340,7 @@ impl ExternalPlugin {
         ));
         *self.runtime.lock().await = Some(PluginRuntime {
             generation,
+            started: false,
             authenticated_peer,
             initialized_lifecycle: None,
             status_declaration: StatusDeclaration::Pending,
@@ -536,13 +548,22 @@ impl ExternalPlugin {
         if let Some(reason) = self.disabled_reason().await {
             bail!("Plugin '{}' is disabled: {}", self.spec.name, reason);
         }
-        if self.runtime.lock().await.is_some() {
+        // A start in progress holds the restart lock until its process has
+        // the mesh snapshot (`announce_started`): a caller that finds the
+        // lock taken waits for it rather than reach the process first. The
+        // guard is held while the runtime is checked, so no start can begin
+        // in between (the restart lock is always taken before the runtime's).
+        if let Ok(_no_start_in_progress) = self.restart_lock.try_lock()
+            && self.runtime_started().await == Some(true)
+        {
             return Ok(());
         }
         let _guard = self.restart_lock.lock().await;
         self.reject_shutdown()?;
-        if self.runtime.lock().await.is_some() {
-            return Ok(());
+        match self.runtime_started().await {
+            Some(true) => return Ok(()),
+            Some(false) => self.discard_unfinished_start().await,
+            None => {}
         }
 
         self.authenticated_peer.store(false, Ordering::Release);
@@ -597,7 +618,21 @@ impl ExternalPlugin {
             .finish_initialize(generation, outbound_tx, pending)
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) if !self.announce_starts.load(Ordering::Acquire) => {
+                self.mark_started(generation).await;
+                Ok(())
+            }
+            Ok(()) => match self.announce_started(generation).await {
+                Ok(()) => {
+                    self.mark_started(generation).await;
+                    Ok(())
+                }
+                Err(error) => {
+                    self.handle_runtime_failure(Some(generation), error.to_string())
+                        .await;
+                    Err(error)
+                }
+            },
             Err(error) => {
                 if self.is_disabled().await {
                     return Ok(());
@@ -1101,7 +1136,7 @@ pub(crate) mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    fn test_host_mode() -> PluginHostMode {
+    pub(super) fn test_host_mode() -> PluginHostMode {
         PluginHostMode {
             mesh_visibility: MeshVisibility::Private,
         }
@@ -1308,6 +1343,7 @@ pub(crate) mod tests {
             }),
             restart_lock: Arc::new(Mutex::new(())),
             stopping: AtomicBool::new(false),
+            announce_starts: AtomicBool::new(false),
             next_request_id: AtomicU64::new(1),
             next_generation: AtomicU64::new(1),
             in_process: None,
@@ -1353,6 +1389,7 @@ pub(crate) mod tests {
         let (outbound_tx, _outbound_rx) = mpsc::channel(1);
         *plugin.runtime.lock().await = Some(PluginRuntime {
             generation,
+            started: true,
             authenticated_peer: true,
             initialized_lifecycle: None,
             status_declaration: StatusDeclaration::Pending,
@@ -1926,6 +1963,7 @@ pub(crate) mod tests {
         let (outbound_tx, outbound_rx) = mpsc::channel(1);
         *plugin.runtime.lock().await = Some(PluginRuntime {
             generation: 1,
+            started: true,
             authenticated_peer: true,
             initialized_lifecycle: None,
             status_declaration: StatusDeclaration::Pending,
