@@ -65,6 +65,12 @@ pub struct Transaction {
     pub status_msg: Option<String>,
     pub created_at_ms: u64,
     pub settled_at_ms: Option<u64>,
+    /// The payment's preimage as 64 hex digits, for a `Succeeded` payment
+    /// whose provider reports one. A payer holds it only once the payee
+    /// released it, so it proves the payment completed. Providers leave it
+    /// `None` for pending and failed payments, and when their API has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preimage: Option<String>,
 }
 
 impl Transaction {
