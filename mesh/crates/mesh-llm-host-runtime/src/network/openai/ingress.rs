@@ -811,7 +811,7 @@ async fn try_route_plugin_model(
     {
         Ok(Some(endpoint)) => {
             let exchange_id =
-                mint_and_publish_effective_raw_proxy(plugin_manager, model_name).await;
+                mint_and_publish_effective_raw_proxy(plugin_manager, request, model_name).await;
             let outcome = proxy::route_http_endpoint_request(
                 ctx.node,
                 Some(model_name),
@@ -1040,7 +1040,7 @@ async fn route_prepared_request(
         let announce = (!request.is_tokenize_request() && has_subscriber)
             .then_some(channel)
             .flatten()
-            .map(|channel| (channel, uuid::Uuid::new_v4().to_string()));
+            .map(|channel| (channel, request.exchange_id()));
         // Digest the REAL request body up front, while the parsed body is still
         // in hand and before `route_model_request` streams it to the backend —
         // this is the one binding a downstream capsule needs to tie its
