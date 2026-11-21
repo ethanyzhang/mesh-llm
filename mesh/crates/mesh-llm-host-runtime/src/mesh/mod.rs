@@ -114,6 +114,7 @@ mod stage_proto;
 mod stage_transport;
 mod stage_transport_bridge;
 mod stun;
+mod task_census;
 mod weights_digest;
 
 pub(crate) use connections::parse_invite_token;
@@ -218,6 +219,7 @@ pub(crate) use mesh_llm_membership::peer_health::resolve_peer_down;
 use mesh_llm_membership::peer_health::{PeerDownReportDisposition, peer_down_report_disposition};
 pub(crate) use stage_proto::stage_status_from_load;
 use stage_proto::*;
+use task_census::TaskKind;
 
 #[cfg(test)]
 pub(crate) mod tests;

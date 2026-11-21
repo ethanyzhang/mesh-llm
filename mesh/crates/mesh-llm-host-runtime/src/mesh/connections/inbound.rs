@@ -7,6 +7,7 @@ mod stage;
 impl Node {
     pub(crate) async fn handle_incoming(&self, incoming: iroh::endpoint::Incoming) -> Result<()> {
         let started = std::time::Instant::now();
+        let handshake = self.task_census.enter(TaskKind::AcceptHandshake);
         let mut accepting = incoming.accept().inspect_err(|_| {
             record_mesh_operational_event_with_context(
                 MeshOperationalEvent::QuicHandlerFailed(
@@ -32,6 +33,13 @@ impl Node {
             );
         })?;
         let remote = conn.remote_id();
+        // A stage connection stays open for its whole life, so its handshake
+        // ends here rather than when the dispatcher returns.
+        let handshake = if alpn == skippy_protocol::STAGE_ALPN_V2 {
+            None
+        } else {
+            Some(handshake)
+        };
         if self.handle_stage_alpn(&alpn, conn.clone(), remote).await {
             return Ok(());
         }
@@ -78,6 +86,7 @@ impl Node {
             self.spawn_reconnect_gossip(conn.clone(), remote);
         }
 
+        drop(handshake);
         self.dispatch_streams(conn, remote).await;
         Ok(())
     }

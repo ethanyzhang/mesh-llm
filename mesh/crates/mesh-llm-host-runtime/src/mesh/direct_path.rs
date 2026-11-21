@@ -226,7 +226,7 @@ impl Node {
         if let Some(existing) = existing.filter(|existing| existing.stable_id() != conn.stable_id())
         {
             record_draining_replaced_connection(remote, Some(&existing), &conn);
-            Self::spawn_replaced_connection_drain(remote, existing);
+            self.spawn_replaced_connection_drain(remote, existing);
         }
     }
 }

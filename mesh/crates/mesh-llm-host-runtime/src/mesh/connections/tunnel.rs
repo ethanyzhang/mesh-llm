@@ -61,6 +61,7 @@ impl Node {
     }
 
     pub(crate) async fn _dispatch_streams(&self, conn: Connection, remote: EndpointId) {
+        let _census = self.task_census.enter(TaskKind::Dispatcher);
         let protocol = connection_protocol(&conn);
         let dispatcher_stable_id = conn.stable_id();
         let pre_admission_slots = super::super::pre_admission::PreAdmissionSlots::new();

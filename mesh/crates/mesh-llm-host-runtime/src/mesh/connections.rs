@@ -651,6 +651,20 @@ impl Node {
 
     // --- Connection handling ---
 
+    /// Spawn `task` counted under `kind` in the live-task census. The guard
+    /// is made before the spawn and moved into the task, so a task dropped
+    /// before its first poll is still counted once and uncounted once.
+    pub(crate) fn spawn_counted<F>(&self, kind: TaskKind, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let guard = self.task_census.enter(kind);
+        tokio::spawn(async move {
+            let _guard = guard;
+            task.await;
+        });
+    }
+
     pub(crate) async fn accept_loop(&self) {
         // Wait until start_accepting() is called before processing any connections.
         // Check flag first to handle the case where start_accepting() was called before we got here.
@@ -690,7 +704,8 @@ impl Node {
                         break;
                     };
                     let node = self.clone();
-                    tokio::spawn(Box::pin(async move {
+                    node.clone()
+                        .spawn_counted(TaskKind::ControlAccept, Box::pin(async move {
                         if let Err(error) = node.handle_control_incoming(incoming).await {
                             tracing::debug!("Control-plane incoming connection error: {error}");
                         }
@@ -723,7 +738,7 @@ impl Node {
         if let Some(replaced) = replaced
             && replaced.stable_id() != conn.stable_id()
         {
-            Self::spawn_replaced_connection_drain(remote, replaced);
+            self.spawn_replaced_connection_drain(remote, replaced);
         }
         (was_dead, admitted)
     }
@@ -734,8 +749,8 @@ impl Node {
     /// connection is explicitly closed. Without the terminal close a replaced
     /// connection is preserved indefinitely; without the grace period in-flight
     /// requests are cut off mid-stream.
-    pub(super) fn spawn_replaced_connection_drain(remote: EndpointId, replaced: Connection) {
-        tokio::spawn(async move {
+    pub(super) fn spawn_replaced_connection_drain(&self, remote: EndpointId, replaced: Connection) {
+        self.spawn_counted(TaskKind::ReplacedDrain, async move {
             tracing::debug!(
                 peer = %remote.fmt_short(),
                 drain_ms = REPLACED_CONNECTION_DRAIN_GRACE.as_millis(),
@@ -752,7 +767,7 @@ impl Node {
 
     pub(crate) fn spawn_reconnect_gossip(&self, conn: Connection, remote: EndpointId) {
         let node = self.clone();
-        tokio::spawn(async move {
+        self.spawn_counted(TaskKind::ReconnectGossip, async move {
             if let Err(e) = node.initiate_gossip_inner(conn, remote, false).await {
                 tracing::debug!("Reconnect gossip with {} failed: {e}", remote.fmt_short());
             }
@@ -765,6 +780,7 @@ impl Node {
         remote: EndpointId,
         closing_stable_id: usize,
     ) {
+        let _census = self.task_census.enter(TaskKind::DispatcherRecovery);
         let recovery = self
             .remove_closed_connection(remote, closing_stable_id)
             .await;
@@ -832,6 +848,7 @@ impl Node {
                 "Connection to {} keeps closing; waiting before the redial",
                 remote.fmt_short()
             );
+            let _census = self.task_census.enter(TaskKind::RedialBackoffWait);
             tokio::time::sleep(ticket.delay).await;
         }
         let mut state = self.state.lock().await;
@@ -1001,7 +1018,7 @@ impl Node {
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         let node = self.clone();
-        tokio::spawn(async move {
+        self.spawn_counted(TaskKind::GossipStream, async move {
             let _slot = slot;
             if let Err(error) = node
                 .handle_gossip_stream(remote, protocol, send, recv)
@@ -1019,7 +1036,7 @@ impl Node {
         recv: iroh::endpoint::RecvStream,
     ) {
         let node = self.clone();
-        tokio::spawn(async move {
+        self.spawn_counted(TaskKind::TunnelMapStream, async move {
             if let Err(error) = node.handle_tunnel_map_stream(remote, protocol, recv).await {
                 tracing::warn!(
                     "Tunnel map stream error from {}: {error}",
@@ -1038,7 +1055,7 @@ impl Node {
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         let node = self.clone();
-        tokio::spawn(async move {
+        self.spawn_counted(TaskKind::RouteRequestStream, async move {
             let _slot = slot;
             if protocol == ControlProtocol::ProtoV1 {
                 let proto_buf =
@@ -1119,7 +1136,7 @@ impl Node {
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         let node = self.clone();
-        tokio::spawn(async move {
+        self.spawn_counted(TaskKind::PluginStream, async move {
             let _slot = slot;
             if let Err(error) = node.handle_plugin_channel_stream(remote, send, recv).await {
                 tracing::debug!(
@@ -1139,7 +1156,7 @@ impl Node {
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         let node = self.clone();
-        tokio::spawn(async move {
+        self.spawn_counted(TaskKind::PluginStream, async move {
             let _slot = slot;
             if let Err(error) = node.handle_plugin_bulk_stream(remote, send, recv).await {
                 tracing::debug!(
@@ -1159,7 +1176,7 @@ impl Node {
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         let node = self.clone();
-        tokio::spawn(async move {
+        self.spawn_counted(TaskKind::PluginStream, async move {
             let _slot = slot;
             if let Err(error) = node.handle_plugin_mesh_stream(remote, send, recv).await {
                 tracing::debug!(
@@ -1177,7 +1194,7 @@ impl Node {
         recv: iroh::endpoint::RecvStream,
     ) {
         let node = self.clone();
-        tokio::spawn(async move {
+        self.spawn_counted(TaskKind::SubprotocolStream, async move {
             if let Err(error) = node
                 .handle_mesh_subprotocol_stream(remote, send, recv)
                 .await
@@ -1196,7 +1213,7 @@ impl Node {
         recv: iroh::endpoint::RecvStream,
     ) {
         let node = self.clone();
-        tokio::spawn(async move {
+        self.spawn_counted(TaskKind::PeerDownStream, async move {
             node.handle_peer_down_stream(remote, recv).await;
         });
     }
@@ -1235,7 +1252,7 @@ impl Node {
         recv: iroh::endpoint::RecvStream,
     ) {
         let node = self.clone();
-        tokio::spawn(async move {
+        self.spawn_counted(TaskKind::PeerLeavingStream, async move {
             node.handle_peer_leaving_stream(remote, recv).await;
         });
     }
@@ -1596,7 +1613,7 @@ impl Node {
     /// re-election for split mode.
     pub(super) fn schedule_selected_path_recheck(&self, peer_id: EndpointId) {
         let node_for_recheck = self.clone();
-        tokio::spawn(async move {
+        self.spawn_counted(TaskKind::PathRecheck, async move {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let conn = node_for_recheck
                 .state

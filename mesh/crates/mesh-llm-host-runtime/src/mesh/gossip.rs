@@ -4,7 +4,7 @@
 use super::{
     DEAD_PEER_TTL, InviteTokenMaterial, MeshOperationalEvent, MeshPeerRemovalReason,
     MeshPolicyRejectionReason, Node, PEER_CONNECT_AND_GOSSIP_TIMEOUT, PEER_STALE_SECS,
-    PeerAnnouncement, PeerInfo, connect_mesh, elapsed_ms_u64, emit_mesh_info,
+    PeerAnnouncement, PeerInfo, TaskKind, connect_mesh, elapsed_ms_u64, emit_mesh_info,
     mesh_peer_operational_context, parse_invite_token, record_mesh_operational_event,
     record_mesh_operational_event_with_context,
 };
@@ -365,6 +365,7 @@ impl Node {
         {
             return;
         }
+        let _census = self.task_census.enter(TaskKind::DiscoveryConnect);
         if let Err(error) = Box::pin(self.connect_to_peer(addr)).await {
             if log_discovery_failure_as_warning {
                 tracing::warn!("Failed to discover peer: {error}");
@@ -403,7 +404,7 @@ impl Node {
         log_discovery_failure_as_warning: bool,
     ) {
         let node = self.clone();
-        tokio::spawn(async move {
+        self.spawn_counted(TaskKind::DiscoverySpawn, async move {
             node.connect_discovered_peers(
                 &their_announcements,
                 known_peer_check_uses_connections,

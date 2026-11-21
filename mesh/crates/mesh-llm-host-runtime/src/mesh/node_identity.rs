@@ -440,6 +440,7 @@ impl Node {
             .1
             .store(true, std::sync::atomic::Ordering::Release);
         self.accepting.0.notify_waiters();
+        super::task_census::spawn_reporter(self.task_census.clone());
         let node = self.clone();
         tokio::spawn(async move {
             let plugin_manager = node.plugin_manager.lock().await.clone();
