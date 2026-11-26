@@ -282,3 +282,78 @@ describe('LogRequestDiagnostics', () => {
     )
   })
 })
+
+describe('LogRequestDiagnostics receipt presentation rules', () => {
+  it('R1: says who reported, what was checked with each result, and that this view did not re-check', () => {
+    renderDiagnostics({ request: request(), attempts: [attempt(1), attempt(2)] })
+
+    expect(screen.getByTestId('diagnostic-self-report')).toHaveTextContent(
+      "Reported by this node's own request log: errors recorded: 2; retries: 1. This view shows that report; it did not re-check anything itself."
+    )
+  })
+
+  it('R3: reads the outcome and event tokens as words with the recorded code kept beside them', () => {
+    renderDiagnostics({
+      request: request({ outcome: 'failed', statusCode: 502 }),
+      events: [event({ sequence: 1, kind: 'attempt_failed', occurredAt: '2026-08-04T12:00:01Z' })]
+    })
+
+    const state = screen.getByRole('status', { name: '' })
+    expect(within(state).getByText('Failed')).toBeInTheDocument()
+    expect(within(state).getByText('failed', { selector: 'code' })).toBeInTheDocument()
+    expect(screen.getByText('Attempt failed')).toBeInTheDocument()
+    expect(screen.getByText('attempt_failed', { selector: 'code' })).toBeInTheDocument()
+  })
+
+  it('R6: says each instant with its date and the reader zone', () => {
+    renderDiagnostics({
+      request: request({ outcome: 'failed' }),
+      events: [event({ sequence: 1, kind: 'attempt_failed', occurredAt: '2026-08-04T12:00:01Z' })]
+    })
+
+    const instants = document.querySelectorAll('time')
+    expect(instants.length).toBeGreaterThan(0)
+    for (const instant of instants) {
+      expect(instant.textContent).toMatch(/^[A-Z][a-z]{2} \d{1,2}, 2026, \d{1,2}:\d{2}:\d{2}\s[AP]M \S+$/)
+      expect(instant.getAttribute('datetime')).toMatch(/^2026-08-04T12:00:0\dZ$/)
+    }
+  })
+
+  it('R7: lists problems in one section and says "None reported." once when there are none', () => {
+    renderDiagnostics({ request: request({ outcome: 'failed' }) })
+
+    const section = screen.getByRole('region', { name: 'Problems spotted' })
+    expect(within(section).getByRole('heading', { name: 'Problems spotted' })).toBeInTheDocument()
+    expect(screen.getAllByText('None reported.')).toHaveLength(1)
+  })
+
+  it('R7: does not say "None reported." while a problem is listed', () => {
+    renderDiagnostics({
+      request: request({ outcome: 'failed' }),
+      artifacts: [artifact({ sequence: 1, kind: 'error_body' })]
+    })
+
+    expect(screen.queryByText('None reported.')).not.toBeInTheDocument()
+  })
+
+  it('R7: does not say "None reported." above a failed attempt the summary reports', () => {
+    renderDiagnostics({ request: request(), attempts: [attempt(1)] })
+
+    expect(screen.queryByText('None reported.')).not.toBeInTheDocument()
+    expect(screen.getByText('HTTP 502', { exact: true })).toBeInTheDocument()
+  })
+
+  it('R6: keeps the recorded terminal instant on a time element', () => {
+    renderDiagnostics({ request: request({ outcome: 'failed' }) })
+
+    const terminal = within(screen.getByRole('region', { name: 'Terminal record' })).getByText(/2026/)
+    expect(terminal.tagName).toBe('TIME')
+    expect(terminal).toHaveAttribute('datetime', '2026-08-04T12:00:04Z')
+  })
+
+  it('R1: counts a failed attempt among the errors the log recorded', () => {
+    renderDiagnostics({ request: request(), attempts: [attempt(1)] })
+
+    expect(screen.getByTestId('diagnostic-self-report')).toHaveTextContent('errors recorded: 1; retries: 0')
+  })
+})
